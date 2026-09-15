@@ -20,15 +20,29 @@ from cuty_live_browser import solve_turnstile
 from gplinks_http_fast import GPLINKS_TURNSTILE_SITEKEY, TurnstilePrewarmer, _post_final_gate as post_gplinks_final_gate_http
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-CHROME_PATH = "/usr/bin/google-chrome" if Path("/usr/bin/google-chrome").exists() else "/usr/bin/google-chrome-stable"
+#CHROME_PATH = "/usr/bin/google-chrome" if Path("/usr/bin/google-chrome").exists() else "/usr/bin/google-chrome-stable"
+CHROME_PATH = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
 GPLINKS_HOSTS = {"gplinks.co", "www.gplinks.co"}
 POWERGAM_HOSTS = {"powergam.online", "www.powergam.online"}
+SKRRESULTS_HOSTS = {"skrresults.com", "www.skrresults.com"}
+STEP_HOSTS = POWERGAM_HOSTS | SKRRESULTS_HOSTS
 GPLINKS_DIRECT_POWERGAM = os.getenv("SHORTLINK_BYPASS_GPLINKS_DIRECT_POWERGAM", "0").strip().lower() in {"1", "true", "yes", "on"}
 GPLINKS_NAVIGATE_FINAL = os.getenv("SHORTLINK_BYPASS_GPLINKS_NAVIGATE_FINAL", "0").strip().lower() in {"1", "true", "yes", "on"}
 GPLINKS_EARLY_CONTINUE_SECONDS = max(0, int(os.getenv("SHORTLINK_BYPASS_GPLINKS_EARLY_CONTINUE_SECONDS", "0") or "0"))
 GPLINKS_HTTP_FINAL_HANDOFF = os.getenv("SHORTLINK_BYPASS_GPLINKS_HTTP_FINAL_HANDOFF", "0").strip().lower() in {"1", "true", "yes", "on"}
 GPLINKS_LIVE_TURNSTILE_PREWARM = os.getenv("SHORTLINK_BYPASS_GPLINKS_LIVE_TURNSTILE_PREWARM", "1").strip().lower() in {"1", "true", "yes", "on"}
 GPLINKS_LIVE_TURNSTILE_PREWARM_WAIT_SECONDS = float(os.getenv("SHORTLINK_BYPASS_GPLINKS_LIVE_TURNSTILE_PREWARM_WAIT_SECONDS", "3") or "3")
+
+
+INJECT_TURNSTILE_TOKEN_JS = r"""
+const t = arguments[0];
+for (const n of ['cf-turnstile-response', 'g-recaptcha-response']) {
+  let e = document.querySelector(`[name="${n}"]`);
+  if (!e) { e = document.createElement('textarea'); e.name = n; e.style.display = 'none'; const f = document.querySelector('form'); if (f) f.appendChild(e); }
+  e.value = t;
+}
+if (typeof window.onTurnstileCompleted === 'function') { window.onTurnstileCompleted(t); }
+"""
 
 
 def detect_chrome_major() -> int | None:
@@ -421,11 +435,50 @@ def is_final_url(url: str | None) -> bool:
     if parsed.scheme not in {"http", "https"}:
         return False
     host = parsed.netloc.lower()
-    if not host or host in GPLINKS_HOSTS or host in POWERGAM_HOSTS:
+    if not host or host in GPLINKS_HOSTS or host in STEP_HOSTS:
         return False
     if parsed.path.startswith("/link-error"):
         return False
     return True
+
+
+def _with_skip_sub(url: str) -> str:
+    sep = "&" if "?" in url else "?"
+    return f"{url}{sep}skip_sub=1"
+
+
+def _gate_marker_in_text(text: str) -> bool:
+    return bool(text) and ("Continue with ads" in text or "gateModal" in text or "skip_sub" in text)
+
+
+def _dismiss_gplinks_gate(driver) -> dict:
+    """Dismiss the gplinks subscription paywall gate inside the real browser.
+
+    The entry page now renders a gate overlay instead of a server redirect.
+    Clicking "Continue with ads" lets the page's own JS run the GET/POST calls
+    that persist the step cookies and then navigate to the PowerGam/SkrResults
+    step host. A raw HTTP GET of the same URL cannot replicate that state.
+    """
+    result = js(
+        driver,
+        r"""
+        const out = {gate_present: false, clicked: false, href: ''};
+        const bodyText = (document.body && document.body.innerText) || '';
+        if (/Continue with ads/i.test(bodyText) || document.getElementById('gateModal') || document.querySelector('.gate-btn-skip')) {
+            out.gate_present = true;
+        }
+        const skip = document.querySelector('a.gate-btn-skip')
+            || [...document.querySelectorAll('a')].find(a => /continue with ads/i.test((a.textContent || a.innerText || '')));
+        if (skip) {
+            out.href = skip.getAttribute('href') || '';
+            out.clicked = true;
+            try { skip.click(); } catch(e) { out.click_error = String(e); }
+            return out;
+        }
+        return out;
+        """,
+    )
+    return result or {"gate_present": False, "clicked": False}
 
 
 def wait_not_cloudflare(driver, timeout: float) -> dict:
@@ -478,7 +531,11 @@ def wait_document_ready(driver, timeout: float = 20, interval: float = 0.5) -> d
     end = time.time() + timeout
     last = state(driver, "ready-wait")
     while time.time() < end:
-        last = state(driver, "ready-wait")
+        try:
+            last = state(driver, "ready-wait")
+        except Exception:
+            time.sleep(interval)
+            continue
         text = (last.get("text") or "").strip().lower()
         title = (last.get("title") or "").strip().lower()
         if text and "performing security verification" not in text and "just a moment" not in title:
@@ -549,6 +606,8 @@ def unlock_final_gate(driver, solver_url: str, timeout_left: int, prewarmer: Tur
     app_vars = before.get("app_vars") or {}
     sitekey = before.get("sitekey")
     token = None
+    token_source = None
+    solver_error = None
     if sitekey and str(app_vars.get("cloudflare_turnstile_on", "")).lower() != "no":
         token_source = "sync"
         if prewarmer:
@@ -558,11 +617,18 @@ def unlock_final_gate(driver, solver_url: str, timeout_left: int, prewarmer: Tur
             else:
                 actions.append({"stage": "turnstile-prewarm-miss", "sitekey": sitekey, "error": prewarmer.error, "matched_sitekey": sitekey == prewarmer.sitekey})
         if not token:
-            token = solve_turnstile(solver_url, "https://gplinks.co/", sitekey, max(60, timeout_left))
-        actions.append({"stage": "turnstile-token", "sitekey": sitekey, "token_len": len(token), "source": token_source})
-    if before.get("captchaInput") and not token:
-        actions.append({"stage": "captcha-required", "reason": "captchaShortlink_captcha input present and no solver value available"})
-        return {"actions": actions, "sitekey": sitekey, "token_used": False, "captcha_required": True}
+            try:
+                token = solve_turnstile(solver_url, "https://gplinks.co/", sitekey, max(60, timeout_left))
+            except Exception as exc:
+                solver_error = str(exc)[:300]
+                actions.append({"stage": "turnstile-solve-error", "sitekey": sitekey, "error": solver_error})
+        if token:
+            actions.append({"stage": "turnstile-token", "sitekey": sitekey, "token_len": len(token), "source": token_source or "sync"})
+        elif solver_error:
+            actions.append({"stage": "turnstile-solver-unavailable", "sitekey": sitekey, "error": solver_error})
+    if (before.get("captchaInput") or sitekey) and not token:
+        actions.append({"stage": "captcha-required", "reason": "Turnstile/image captcha token could not be obtained" + (f" (solver error: {solver_error})" if solver_error else "")})
+        return {"actions": actions, "sitekey": sitekey, "token_used": False, "captcha_required": True, "solver_error": solver_error}
 
     submit = js(
         driver,
@@ -615,7 +681,7 @@ def unlock_final_gate(driver, solver_url: str, timeout_left: int, prewarmer: Tur
     return {"actions": actions, "sitekey": sitekey, "token_used": bool(token), "final_href": final_href}
 
 
-def run(url: str, timeout: int, solver_url: str) -> dict:
+def run(url: str, timeout: int, solver_url: str, keep_open: bool = False, driver_holder: list | None = None) -> dict:
     started = time.time()
     timeline: list[dict] = []
     prewarmer: TurnstilePrewarmer | None = None
@@ -635,6 +701,8 @@ def run(url: str, timeout: int, solver_url: str) -> dict:
     decoded = decoded_power_query(power_url) if power_url else {}
 
     driver = build_driver()
+    if driver_holder is not None:
+        driver_holder.append(driver)
     try:
         timeline.append({"stage": "pre-navigation-recorders", **install_pre_navigation_recorders(driver)})
         if GPLINKS_DIRECT_POWERGAM and power_url:
@@ -656,18 +724,25 @@ def run(url: str, timeout: int, solver_url: str) -> dict:
             wait_document_ready(driver, 25)
             timeline.append(state(driver, "entry"))
 
-        if urlparse(driver.current_url).netloc.lower() not in POWERGAM_HOSTS:
+        current_host = urlparse(driver.current_url).netloc.lower()
+        if current_host not in STEP_HOSTS:
             if not power_url:
-                return {"status": 0, "stage": "entry", "message": "POWERGAM_REDIRECT_NOT_FOUND", "entry_status": entry.status_code, "timeline": timeline}
-            try:
-                driver.execute_cdp_cmd("Network.enable", {})
-                driver.execute_cdp_cmd("Network.setExtraHTTPHeaders", {"headers": {"Referer": url}})
-            except Exception:
-                pass
-            driver.get(power_url)
-            install_gpt_lifecycle_probe(driver)
-            install_network_ledger_recorder(driver)
-            wait_document_ready(driver, 25)
+                gate_hit = _dismiss_gplinks_gate(driver)
+                timeline.append({"stage": "entry-gate-dismiss", **gate_hit})
+                wait_document_ready(driver, 20)
+                current_host = urlparse(driver.current_url).netloc.lower()
+            if current_host not in STEP_HOSTS:
+                if not power_url:
+                    return {"status": 0, "stage": "entry", "message": "POWERGAM_REDIRECT_NOT_FOUND", "entry_status": entry.status_code, "gate_detected": gate_hit.get("gate_present"), "timeline": timeline}
+                try:
+                    driver.execute_cdp_cmd("Network.enable", {})
+                    driver.execute_cdp_cmd("Network.setExtraHTTPHeaders", {"headers": {"Referer": url}})
+                except Exception:
+                    pass
+                driver.get(power_url)
+                install_gpt_lifecycle_probe(driver)
+                install_network_ledger_recorder(driver)
+                wait_document_ready(driver, 25)
         install_gpt_lifecycle_probe(driver)
         install_network_ledger_recorder(driver)
         timeline.append(state(driver, "power-entry"))
@@ -713,19 +788,46 @@ def run(url: str, timeout: int, solver_url: str) -> dict:
         timeline.extend(unlock.get("actions") or [])
         timeline.append(collect_gpt_lifecycle_events(driver, "final-gpt-lifecycle"))
         timeline.append(collect_network_ledger_events(driver, "final-network-ledger"))
+
+        # The target page can still sit behind a Cloudflare interstitial (pre or post submit).
+        # Wait it out, and if a fresh Turnstile appears after the gate submit, solve it so the
+        # real downstream target is revealed instead of the browser closing on the captcha.
+        post_cf = wait_not_cloudflare(driver, 35)
+        timeline.append({**post_cf, "stage": "post-unlock-cloudflare"})
+        post_sitekey = post_cf.get("sitekey")
+        if post_sitekey and (post_sitekey != unlock.get("sitekey") or unlock.get("solver_error")):
+            try:
+                ptoken = solve_turnstile(solver_url, "https://gplinks.co/", post_sitekey, max(60, timeout - int(time.time() - started)))
+                js(driver, INJECT_TURNSTILE_TOKEN_JS, ptoken)
+                timeline.append({"stage": "post-unlock-turnstile-token", "sitekey": post_sitekey, "token_len": len(ptoken)})
+                time.sleep(2)
+            except Exception as exc:
+                timeline.append({"stage": "post-unlock-turnstile-error", "error": str(exc)[:240]})
+
+        final_url = unlock.get("final_href")
         final_state = state(driver, "final")
         timeline.append(final_state)
-        final_url = final_state.get("href") or driver.current_url
+        for _ in range(20):
+            time.sleep(1)
+            st = state(driver, "post-unlock-poll")
+            href = (st.get("captchaButton") or {}).get("href") or st.get("href") or driver.current_url
+            if is_final_url(href):
+                final_url = href
+                timeline.append(st)
+                break
+        if not final_url:
+            final_url = final_state.get("href") or driver.current_url
         button_url = unlock.get("final_href") or ((final_state.get("captchaButton") or {}).get("href"))
         if is_final_url(button_url) or is_final_url(final_url):
             target = button_url if is_final_url(button_url) else final_url
             return {"status": 1, "stage": "live-browser-final-gate", "bypass_url": target, "final_url": target, "decoded_query": decoded, "sitekey": unlock.get("sitekey"), "token_used": unlock.get("token_used"), "timeline": timeline, "waited_seconds": round(time.time() - started, 1)}
         return {"status": 0, "stage": "final-gate", "message": "FINAL_TARGET_NOT_REACHED", "final_url": final_url, "decoded_query": decoded, "sitekey": unlock.get("sitekey"), "token_used": unlock.get("token_used"), "timeline": timeline}
     finally:
-        try:
-            driver.quit()
-        except Exception:
-            pass
+        if driver is not None and not keep_open:
+            try:
+                driver.quit()
+            except Exception:
+                pass
 
 
 def main() -> int:
@@ -738,12 +840,32 @@ def main() -> int:
     parser.add_argument("url")
     parser.add_argument("--timeout", type=int, default=300)
     parser.add_argument("--solver-url", default="http://127.0.0.1:5000")
+    parser.add_argument("--keep-open", action="store_true", help="keep the browser window open after finishing so you can inspect the final page")
     args = parser.parse_args()
+    holder: list = []
     try:
-        payload = run(args.url, args.timeout, args.solver_url)
+        payload = run(args.url, args.timeout, args.solver_url, keep_open=args.keep_open, driver_holder=holder)
     except Exception as exc:
         payload = {"status": 0, "stage": "exception", "message": str(exc)}
-    print(json.dumps(payload, ensure_ascii=False))
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+    print(json.dumps(payload, ensure_ascii=False), flush=True)
+    if args.keep_open and holder:
+        driver = holder[0]
+        try:
+            print("Browser kept open for inspection. Close the window to exit.", file=sys.stderr)
+            while True:
+                try:
+                    if not driver.window_handles:
+                        break
+                except Exception:
+                    break
+                time.sleep(1)
+        finally:
+            try:
+                driver.quit()
+            except Exception:
+                pass
     return 0 if payload.get("status") == 1 else 1
 
 

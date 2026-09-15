@@ -96,7 +96,7 @@ class ShortlinkBypassEngine:
         self.session = requests.Session()
         self.session.headers.update(DEFAULT_HEADERS)
 
-    def analyze(self, url: str) -> BypassResult:
+    def analyze(self, url: str, keep_open: bool = False) -> BypassResult:
         host = urlparse(url).netloc.lower()
         parsed = urlparse(url)
         if host == "xut.io" or host.endswith(".xut.io"):
@@ -116,7 +116,7 @@ class ShortlinkBypassEngine:
         if host == "sfl.gl" or host.endswith(".sfl.gl"):
             return self._handle_sfl(url)
         if host == "gplinks.co" or host.endswith(".gplinks.co"):
-            return self._handle_gplinks(url)
+            return self._handle_gplinks(url, keep_open=keep_open)
         if host == "ez4short.com" or host.endswith(".ez4short.com"):
             return self._handle_ez4short(url)
         if host == "cuty.io" or host.endswith(".cuty.io") or host == "cuttlinks.com" or host.endswith(".cuttlinks.com"):
@@ -722,7 +722,7 @@ class ShortlinkBypassEngine:
                 blockers=[str(exc)],
             )
 
-    def _handle_gplinks(self, url: str) -> BypassResult:
+    def _handle_gplinks(self, url: str, keep_open: bool = False) -> BypassResult:
         family = "gplinks.co"
         facts: dict[str, Any] = {}
         try:
@@ -752,7 +752,7 @@ class ShortlinkBypassEngine:
                 facts["http_fast_message"] = http_fast.get("message")
                 facts["http_fast_waited_seconds"] = http_fast.get("waited_seconds")
 
-            live = self._resolve_gplinks_live(url)
+            live = self._resolve_gplinks_live(url, keep_open=keep_open)
             if live.get("status") == 1 and live.get("bypass_url"):
                 facts["live_stage"] = live.get("stage")
                 facts["decoded_query"] = live.get("decoded_query")
@@ -776,6 +776,21 @@ class ShortlinkBypassEngine:
                 facts["live_stage"] = live.get("stage")
                 facts["live_message"] = live.get("message")
                 facts["live_final_url"] = live.get("final_url")
+                if live.get("captcha_required") or live.get("solver_error"):
+                    return BypassResult(
+                        status=0,
+                        input_url=url,
+                        family=family,
+                        message="GPLINKS_TURNSTILE_SOLVER_UNAVAILABLE" if live.get("solver_error") else "GPLINKS_CAPTCHA_REQUIRED",
+                        stage="final-gate",
+                        facts=facts,
+                        blockers=[
+                            "final gplinks page membutuhkan Cloudflare Turnstile; solver di 127.0.0.1:5000 tidak bisa dihubungi"
+                            if live.get("solver_error")
+                            else "final gplinks page membutuhkan token captcha yang belum tersedia",
+                            "jalankan solver Turnstile (http://127.0.0.1:5000) lalu ulangi; atau gunakan --keep-open untuk memproses captcha manual di browser",
+                        ],
+                    )
 
             session = self._new_impersonated_session()
             entry = session.get(url, timeout=self.timeout, allow_redirects=False)
@@ -783,15 +798,28 @@ class ShortlinkBypassEngine:
             facts["entry_redirect"] = self._clean_url(entry.headers.get("location", "")) or None
             power_url = facts["entry_redirect"] or ""
             if not power_url:
-                return BypassResult(
-                    status=0,
-                    input_url=url,
-                    family=family,
-                    message="POWERGAM_REDIRECT_NOT_FOUND",
-                    stage="entry",
-                    facts=facts,
-                    blockers=["entry tidak memberi redirect ke powergam.online"],
-                )
+                body = entry.text or ""
+                gate = ("gateModal" in body) or ("Continue with ads" in body) or ("skip_sub" in body)
+                if gate:
+                    skip_url = url + ("&" if "?" in url else "?") + "skip_sub=1"
+                    skip = session.get(skip_url, timeout=self.timeout, allow_redirects=False)
+                    facts["entry_skip_sub_status"] = skip.status_code
+                    facts["entry_skip_sub_redirect"] = self._clean_url(skip.headers.get("location", "")) or None
+                    power_url = facts["entry_skip_sub_redirect"] or ""
+                if not power_url:
+                    return BypassResult(
+                        status=0,
+                        input_url=url,
+                        family=family,
+                        message="GPLINKS_SUBSCRIPTION_GATE" if gate else "POWERGAM_REDIRECT_NOT_FOUND",
+                        stage="entry",
+                        facts=facts,
+                        blockers=(
+                            ["gplinks sekarang menampilkan paywall subscription gate; jalur 'continue with ads' mengarah ke blog skrresults.com, bukan target final"]
+                            if gate else
+                            ["entry tidak memberi redirect ke powergam.online"]
+                        ),
+                    )
 
             decoded = self._decode_gplinks_power_query(power_url)
             facts["decoded_query"] = decoded
@@ -874,7 +902,7 @@ class ShortlinkBypassEngine:
             payload["message"] = f"helper exit {proc.returncode}"
         return payload
 
-    def _resolve_gplinks_live(self, url: str) -> dict[str, Any]:
+    def _resolve_gplinks_live(self, url: str, keep_open: bool = False) -> dict[str, Any]:
         if not (os.path.exists(GPLINKS_LIVE_HELPER) and os.path.exists(GPLINKS_HELPER_PYTHON)):
             return {}
 
@@ -884,17 +912,51 @@ class ShortlinkBypassEngine:
             existing = env.get("PYTHONPATH", "")
             helper_pythonpath = ":".join(helper_pythonpath_parts)
             env["PYTHONPATH"] = f"{helper_pythonpath}:{existing}" if existing else helper_pythonpath
+        cmd = [
+            GPLINKS_HELPER_PYTHON,
+            GPLINKS_LIVE_HELPER,
+            url,
+            "--timeout",
+            str(GPLINKS_BROWSER_TIMEOUT),
+            "--solver-url",
+            GPLINKS_TURNSTILE_SOLVER_URL,
+        ]
+        if keep_open:
+            cmd.append("--keep-open")
         try:
+            if keep_open:
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1, env=env)
+                payload: dict[str, Any] | None = None
+                try:
+                    if proc.stdout is not None:
+                        for raw in proc.stdout:
+                            line = raw.strip()
+                            if not line:
+                                continue
+                            try:
+                                obj = json.loads(line)
+                            except Exception:
+                                continue
+                            payload = obj
+                            break
+                except Exception:
+                    pass
+                if payload is None:
+                    try:
+                        out, err = proc.communicate(timeout=10)
+                    except Exception:
+                        out, err = "", ""
+                    last_line = (out or err or "").strip().splitlines()[-1:]
+                    last_line = last_line[0] if last_line else ""
+                    try:
+                        parsed = json.loads(last_line)
+                    except Exception:
+                        parsed = None
+                    payload = parsed or {"status": 0, "stage": "live-browser-no-output", "message": (err or "").strip() or "helper produced no JSON"}
+                # Intentionally do not wait: the helper keeps the browser open for inspection.
+                return payload
             proc = subprocess.run(
-                [
-                    GPLINKS_HELPER_PYTHON,
-                    GPLINKS_LIVE_HELPER,
-                    url,
-                    "--timeout",
-                    str(GPLINKS_BROWSER_TIMEOUT),
-                    "--solver-url",
-                    GPLINKS_TURNSTILE_SOLVER_URL,
-                ],
+                cmd,
                 capture_output=True,
                 text=True,
                 timeout=GPLINKS_BROWSER_TIMEOUT + 45,
@@ -2500,10 +2562,11 @@ def cli() -> int:
     parser = argparse.ArgumentParser(description="Shortlink bypass engine")
     parser.add_argument("url", help="shortlink URL")
     parser.add_argument("--pretty", action="store_true", help="pretty JSON")
+    parser.add_argument("--keep-open", action="store_true", help="keep the live browser open after finishing (gplinks live helper)")
     args = parser.parse_args()
 
     engine = ShortlinkBypassEngine()
-    result = engine.analyze(args.url)
+    result = engine.analyze(args.url, keep_open=args.keep_open)
     if args.pretty:
         print(json.dumps(result.to_dict(), indent=2, ensure_ascii=False))
     else:

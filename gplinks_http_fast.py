@@ -16,6 +16,8 @@ from cuty_live_browser import solve_turnstile
 
 GPLINKS_HOSTS = {"gplinks.co", "www.gplinks.co"}
 POWERGAM_HOSTS = {"powergam.online", "www.powergam.online"}
+SKRRESULTS_HOSTS = {"skrresults.com", "www.skrresults.com"}
+STEP_HOSTS = POWERGAM_HOSTS | SKRRESULTS_HOSTS
 DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
@@ -89,11 +91,20 @@ def is_final_url(url: str | None) -> bool:
     if parsed.scheme not in {"http", "https"}:
         return False
     host = parsed.netloc.lower()
-    if not host or host in GPLINKS_HOSTS or host in POWERGAM_HOSTS:
+    if not host or host in GPLINKS_HOSTS or host in STEP_HOSTS:
         return False
     if parsed.path.startswith("/link-error"):
         return False
     return True
+
+
+def _with_skip_sub(url: str) -> str:
+    sep = "&" if "?" in url else "?"
+    return f"{url}{sep}skip_sub=1"
+
+
+def _gate_marker_in_text(text: str) -> bool:
+    return bool(text) and ("Continue with ads" in text or "gateModal" in text or "skip_sub" in text)
 
 
 def extract_final_gate(html: str, page_url: str) -> dict:
@@ -177,7 +188,7 @@ def _submit_power_forms(session, forms: list[dict], referer: str, timeout: int, 
         if not form.get("action"):
             continue
         try:
-            headers = {**DEFAULT_HEADERS, "Referer": referer, "Origin": "https://powergam.online"}
+            headers = {**DEFAULT_HEADERS, "Referer": referer, "Origin": f"{urlparse(referer).scheme}://{urlparse(referer).netloc}"}
             if form.get("method") == "POST":
                 response = session.post(form["action"], data=form.get("payload") or {}, headers=headers, timeout=timeout, allow_redirects=True)
             else:
@@ -250,7 +261,18 @@ def run(url: str, timeout: int = 90, solver_url: str = "http://127.0.0.1:5000") 
         power_url = entry.headers.get("location") or ""
         timeline.append({"stage": "entry", "status": entry.status_code, "url": entry.url, "location": power_url})
         if not power_url:
-            return {"status": 0, "stage": "entry", "message": "POWERGAM_REDIRECT_NOT_FOUND", "timeline": timeline, "waited_seconds": round(time.time() - started, 2)}
+            body = entry.text or ""
+            if _gate_marker_in_text(body):
+                skip_url = _with_skip_sub(url)
+                skip = session.get(skip_url, headers=headers, timeout=timeout, allow_redirects=False)
+                power_url = skip.headers.get("location") or ""
+                timeline.append({"stage": "entry-skip-sub", "status": skip.status_code, "url": skip.url, "location": power_url})
+            if not power_url:
+                return {"status": 0, "stage": "entry", "message": "POWERGAM_REDIRECT_NOT_FOUND", "timeline": timeline, "waited_seconds": round(time.time() - started, 2)}
+            if _gate_marker_in_text(body) and (
+                urlparse(power_url).netloc.lower() not in STEP_HOSTS or not raw_power_query(power_url).get("lid")
+            ):
+                return {"status": 0, "stage": "entry", "message": "GPLINKS_SUBSCRIPTION_GATE", "timeline": timeline, "waited_seconds": round(time.time() - started, 2)}
 
         raw = raw_power_query(power_url)
         decoded = decoded_power_query(power_url)
@@ -272,9 +294,10 @@ def run(url: str, timeout: int = 90, solver_url: str = "http://127.0.0.1:5000") 
         except Exception:
             pages = 3
         visitor_id = decoded.get("vid") or ""
+        step_host = f"{urlparse(power.url).scheme}://{urlparse(power.url).netloc}"
         if forms:
             base_form = dict(forms[0])
-            for index, payload in enumerate(build_powergam_step_payloads(pages, visitor_id, target_final_candidate, "https://powergam.online", imps=5), start=1):
+            for index, payload in enumerate(build_powergam_step_payloads(pages, visitor_id, target_final_candidate, step_host, imps=5), start=1):
                 _set_powergam_cookies(session, decoded, power.url, step_count=index - 1, imps=5, raw=raw)
                 step_form = dict(base_form)
                 step_form["payload"] = payload
